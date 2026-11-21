@@ -1,0 +1,380 @@
+---
+title: "Problem Set 4"
+author: "Enzo Castaldo"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+**GitHub repo:** <https://github.com/enzocast1/ec422_ps4_Castaldo>
+
+```{r}
+#| label: packages
+library(tidyverse)
+library(fpp3)
+```
+
+## ARIMA vs. ETS
+
+### The data
+
+```{r}
+#| label: liquor-data
+liquor_raw <- read_csv(
+  "data/MRTSSM4453USN.csv",
+  na = ".",
+  col_types = cols(
+    observation_date = col_date(format = "%Y-%m-%d"),
+    MRTSSM4453USN = col_double()
+  )
+)
+
+liquor <- liquor_raw |>
+  transmute(Month = yearmonth(observation_date), sales = MRTSSM4453USN) |>
+  as_tsibble(index = Month) |>
+  filter(Month <= yearmonth("2019 Dec"))
+
+has_gaps(liquor)
+```
+
+```{r}
+#| label: liquor-plots
+liquor |>
+  autoplot(sales) +
+  labs(title = "U.S. Retail Sales at Beer, Wine, and Liquor Stores",
+       x = "Month", y = "Millions of dollars")
+
+liquor |>
+  gg_season(log(sales)) +
+  labs(title = "Seasonal Plot of Log Liquor Store Sales",
+       x = "Month", y = "log(sales)")
+```
+
+**2.1b.** Liquor store sales trend steadily upward from 1992 to 2019, with a strong seasonal pattern that repeats every year. December is by far the highest month because of holiday spending. Sales are also relatively high in the summer months, while January and February are the lowest. In the level plot, the seasonal swings get bigger as the level of sales rises. This means the seasonality is multiplicative, so taking logs makes the swings roughly constant in size and easier for the models to capture.
+
+### Fitting both models
+
+```{r}
+#| label: liquor-fit
+liquor_fit <- liquor |>
+  model(arima = ARIMA(log(sales)),
+        ets   = ETS(log(sales)))
+
+liquor_fit |> select(arima) |> report()
+liquor_fit |> select(ets) |> report()
+```
+
+**2.2a.** The chosen ARIMA is ARIMA(1,0,2)(2,1,1)[12] with drift. The seasonal difference (D = 1) means log sales are compared with the same month one year earlier, which removes the seasonal pattern. It does not take a regular first difference (d = 0); instead, the drift term captures the upward trend in sales after seasonal differencing. The remaining terms are one AR lag, two MA lags, two seasonal AR lags, and one seasonal MA lag.
+
+The chosen ETS is ETS(A,A,A). It has an additive error, an additive trend, and an additive seasonal component. Because the model is fit to log sales, additive seasonality in logs corresponds to multiplicative seasonality in the level of sales, which matches what we saw in the season plot.
+
+```{r}
+#| label: liquor-resid
+liquor_fit |> select(arima) |> gg_tsresiduals()
+
+# dof = number of AR and MA coefficients (p + q + P + Q) in the chosen ARIMA
+arima_dof <- liquor_fit |>
+  select(arima) |>
+  tidy() |>
+  filter(str_detect(term, "^s?(ar|ma)\\d+$")) |>
+  nrow()
+
+liquor_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24, dof = arima_dof)
+```
+
+**2.2b.** The Ljung–Box test (lag 24, dof = 6) rejects white noise, so there is still some autocorrelation in the residuals that the ARIMA model didn't capture. That doesn't mean the model will forecast badly; it only means there may be structure left over. The horse race below tests how well the model actually forecasts.
+
+### The horse race
+
+The TS-CV was run in my R script and saved, so here I load the fitted models.
+
+```{r}
+#| label: liquor-cv
+liquor_cv_fit <- readRDS("results/liquor_cv_fit.rds")
+
+liquor_cv_fc <- liquor_cv_fit |>
+  forecast(h = 1)
+
+liquor_acc <- liquor_cv_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  select(.model, RMSE, MAE) |>
+  arrange(RMSE)
+
+liquor_acc |> knitr::kable(digits = 2)
+
+best_rmse <- liquor_acc$.model[which.min(liquor_acc$RMSE)]
+best_mae  <- liquor_acc$.model[which.min(liquor_acc$MAE)]
+```
+
+**2.3a.** The first training sample is the first 120 months (January 1992 to December 2001), and the window expands by one month at a time. After dropping the final training sample, there are **216 forecast origins**.
+
+**2.3b.** The first forecast is for **January 2002** and the last is for **December 2019**.
+
+The most accurate model by RMSE is **`r toupper(best_rmse)`**, and by MAE it is **`r toupper(best_mae)`**, so the two metrics `r ifelse(best_rmse == best_mae, "agree", "disagree")`. Both ARIMA and ETS beat the seasonal random walk by a wide margin.
+
+### Are the differences significant?
+
+```{r}
+#| label: liquor-dm
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(as_tibble(liquor) |> select(Month, actual = sales),
+            by = "Month") |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e)
+
+forecast::dm.test(liquor_errs$arima, liquor_errs$ets, h = 1, power = 2)
+forecast::dm.test(liquor_errs$arima, liquor_errs$snaive, h = 1, power = 2)
+```
+
+**2.4.** For ARIMA vs. ETS, DM = −2.91 with a p-value of 0.004. For ARIMA vs. the seasonal random walk, DM = −10.76 with a p-value below 0.001. Both p-values arebelow 0.05, so we reject equal accuracy in both cases. ARIMA is listed first, so the negative DM statistics mean ARIMA has smaller squared errors. ARIMA is significantly more accurate than both ETS and the benchmark, so if I were the liquor store chain I would use the ARIMA model.
+
+## Forecast Combination
+
+```{r}
+#| label: combo
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  select(.model, RMSE, MAE) |>
+  arrange(RMSE) |>
+  knitr::kable(digits = 2)
+
+cor(liquor_errs$arima, liquor_errs$ets)
+```
+
+**3a.** The equal-weight combination is more accurate than ETS but less accurate than ARIMA. It lands between the two models that go into it.
+
+**3b.** The correlation between the ARIMA and ETS forecast errors is about 0.88, which is very high. The two models make similar mistakes, so averaging them doesn't cancel out much error. The DM test in Part 2.4 also showed that ARIMA is significantly more accurate than ETS. Combining helps most when the models are about equally accurate and their errors aren't highly correlated. Hereneither condition holds, so giving half the weight to the weaker ETS model drags the combination below ARIMA.
+
+## VAR vs. BVAR
+
+### The data
+
+```{r}
+#| label: qd-data
+qd_raw <- read_csv("data/fredqd_2026-09.csv", show_col_types = FALSE) |>
+  slice(-(1:2))
+
+growth <- function(x) 100 * difference(log(x))
+
+qd <- qd_raw |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+  transmute(date,
+            gdp    = growth(GDPC1),
+            cons   = growth(PCECC96),
+            inv    = growth(GPDIC1),
+            emp    = growth(PAYEMS),
+            infl   = growth(GDPCTPI),
+            unrate = difference(UNRATE),
+            ffr    = difference(FEDFUNDS),
+            gs10   = difference(GS10)) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+y <- qd |> select(-date) |> as.matrix()
+dim(y)
+
+N <- nrow(y)
+origins <- 120:(N - 1)
+actual <- y[121:N, ]
+```
+
+**4.1c.** The first training sample is the first 120 quarters (1960 Q1 to 1989 Q4), and the window expands by one quarter each time. This gives **120 forecasts** for each variable. The first is for **1990 Q1** and the last is for **2019 Q4**.
+
+### Results
+
+The OLS VARs are fast, so I re-estimate them here because they're needed for the DM tests. The BVAR forecasts and the full RMSE table were saved in my R script.
+
+```{r}
+#| label: var-results
+var_ols_fc <- function(z, p) {
+  e <- embed(z, p + 1)
+  M <- ncol(z)
+  B <- coef(lm(e[, 1:M] ~ e[, -(1:M)]))
+  x <- c(1, t(z[nrow(z):(nrow(z) - p + 1), ]))
+  x %*% B
+}
+
+fc_var4 <- NULL
+for (T in origins) {
+  fc_var4 <- rbind(fc_var4, var_ols_fc(y[1:T, ], 4))
+}
+
+fc_bvar_03  <- readRDS("results/fc_bvar_03.rds")
+var_results <- readRDS("results/var_results.rds")
+
+var_results |> knitr::kable(digits = 3)
+
+# counts used in the text below
+n_var1_beats_var4 <- sum(var_results[["VAR(1)"]] < var_results[["VAR(4)"]])
+n_b03_beats_var4  <- sum(var_results[["BVAR(4), lambda = 0.3"]] < var_results[["VAR(4)"]])
+n_b03_beats_var1  <- sum(var_results[["BVAR(4), lambda = 0.3"]] < var_results[["VAR(1)"]])
+n_b005_beats_b03  <- sum(var_results[["BVAR(4), lambda = 0.05"]] < var_results[["BVAR(4), lambda = 0.3"]])
+```
+
+**4.2. VAR(1) vs. VAR(4).** The VAR(1) has a lower RMSE than the VAR(4) for `r n_var1_beats_var4` of the 8 variables. Even though the VAR(4) contains the VAR(1) as a special case, it has to estimate 264 coefficients instead of 72 with only 120 to 240 quarters of data. The extra coefficients add a lot of estimation error (variance), and that outweighs the small reduction in approximation error from including more lags. This is the bias–variance tradeoff.
+
+**4.3b. BVAR(4), λ = 0.3, vs. VAR(4).** The BVAR(4) beats the OLS VAR(4) for `r n_b03_beats_var4` of the 8 variables. The two models have the same variables and the same lags, so the only difference is shrinkage. The Minnesota prior pulls the coefficients toward zero, especially those on longer lags and on other variables. This accepts a little bias in exchange for a large cut in estimation error.
+
+**BVAR(4), λ = 0.3, vs. VAR(1).** The BVAR(4) beats the VAR(1) for `r n_b03_beats_var1` of the 8 variables. The VAR(1) reduces estimation error by dropping lags entirely, while the BVAR keeps all four lags but shrinks them. Both are ways of controlling the number of effective parameters.
+
+**λ = 0.05.** With the much tighter prior, the BVAR improves on λ = 0.3 for `r n_b005_beats_b03` of the 8 variables. `r ifelse(n_b005_beats_b03 >= 4, "Even heavier shrinkage helps, which tells us that estimation error in this model is large. Pulling the model close to the prior mean (a forecast near each series' average growth rate) still pays off.", "This much shrinkage goes too far. It pushes the forecasts so close to the prior mean that the model ignores useful information in the data, so the gain from lower variance is outweighed by the added bias.")`
+
+**Is the winner's RMSE a fair estimate?** No. If we pick the model with the lowest RMSE from this table, that RMSE is likely too optimistic. We compared several models on the same 120 forecasts and chose the best one, so part of its advantage may be luck in this particular sample. This is selection bias. A fair estimate would need a fresh evaluation period that wasn't used to choose the model.
+
+### DM tests
+
+```{r}
+#| label: var-dm
+# GDP growth (column 1)
+e_var4 <- actual[, "gdp"] - fc_var4[, 1]
+e_bvar <- actual[, "gdp"] - fc_bvar_03[, 1]
+dm_gdp <- forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
+dm_gdp
+
+# Second variable: inflation (column 5)
+e_var4_2 <- actual[, "infl"] - fc_var4[, 5]
+e_bvar_2 <- actual[, "infl"] - fc_bvar_03[, 5]
+dm_2 <- forecast::dm.test(e_var4_2, e_bvar_2, h = 1, power = 2)
+dm_2
+```
+
+**4.3c.** Because the VAR(4) is listed first, a positive DM statistic means the VAR(4) has larger squared errors than the BVAR. For GDP growth, DM = 2.14 with a p-value of 0.035, so we reject equal accuracy at the 5% level: the BVAR(4) is significantly more accurate than the OLS VAR(4). For inflation, DM = 1.45 with a p-value of 0.15, so even though the BVAR has a lower RMSE, we cannot reject that the two models are equally accurate. This means some of the RMSE gaps in 4.3b may be noise. The BVAR beat the VAR(4) for all 8 variables, but only some of those improvements are statistically significant, so we should be careful about reading too much into small differences in the table.
+
+## Factor Model
+
+### The data
+
+```{r}
+#| label: md-data
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,
+         "2" = d(x),
+         "3" = d(d(x)),
+         "4" = log(x),
+         "5" = 100 * d(log(x)),
+         "6" = 100 * d(d(log(x))),
+         "7" = d(x / dplyr::lag(x) - 1))
+}
+
+fm <- map2_dfc(md[names(tcode)], tcode, transform_series) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+fm <- fm[, colSums(is.na(fm)) == 0]
+dim(fm)
+
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+```
+
+**5.1c.**
+
+- **INDPRO (code 5):** the monthly growth rate, 100 × the change in log industrial production.
+- **PAYEMS (code 5):** the monthly growth rate of payroll employment.
+- **CPIAUCSL (code 6):** the change in the monthly growth rate, i.e. the change in monthly CPI inflation (a second difference of the log).
+- **FEDFUNDS (code 2):** the first difference, the change in percentage points.
+
+FEDFUNDS is already measured as a rate in percent, so the natural transformation is its change in percentage points. A growth rate of an interest rate would be hard to interpret and would blow up when rates are near zero. INDPRO is an index level that grows over time, so its growth rate is the meaningful, stationary measure.
+
+### Estimating the factors
+
+```{r}
+#| label: factors
+Z <- fm |> select(-date) |> as.matrix()
+pc <- prcomp(scale(Z))
+summary(pc)$importance[, 1:5]
+
+F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+  theme_minimal()
+
+sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+```
+
+**5.2a.** The first three factors together explain about **29.5%** of the variation in all 121 series (15.0% + 7.4% + 7.1%), which matches what we saw in class.
+
+**5.2b–c.** The first factor drops sharply in every recession, including 1974–75, 1980–82, 2008–09, and smaller dips in 1990–91 and 2001. Its most correlated series are employment and industrial production measures, so it captures **real economic activity**, the business cycle. The second factor is most correlated with price series (CPI components such as commodities, all items less shelter, and transportation, plus CPIAUCSL and the PCE price index), so it captures **inflation**, or price changes across the economy.
+
+### Replicating the horse race from class
+
+```{r}
+#| label: ip-race
+ip <- fm$INDPRO
+n <- nrow(Z)
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+for (T in init:(n - 1)) {
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]
+  d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+  new <- data.frame(y = ip[T], t(F_T[T, ]))
+  e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+  e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+}
+c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+```
+
+**5.3.** The RMSE is 0.617 for the AR(1) and 0.589 with three factors, matching the results from class (about a 4.6% reduction). Estimating the factors once on the full sample would be cheating because it would use data from after each forecast origin, information a real forecaster wouldn't have had at the time. This look-ahead bias would make the factor model look better than it really is.
+
+### A direct forecast of inflation
+
+```{r}
+#| label: cpi-race
+direct_race <- function(series, h = 12, r = 3) {
+  lv <- md |>
+    mutate(log_x = log(.data[[series]]),
+           g = 100 * (log_x - lag(log_x))) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  yh <- 100 * (lead(lv$log_x, h) - lv$log_x)
+  g  <- lv$g
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - h)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+    i <- 1:(T - h)
+    d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+    new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+    e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+    e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+  }
+  tibble(series, forecasts = length(e_ar),
+         RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+         MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+         DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                       varestimator = "bartlett")$p.value)
+}
+
+cpi_race <- direct_race("CPIAUCSL")
+cpi_race |> knitr::kable(digits = 4)
+
+cpi_reduction <- (cpi_race$RMSE_AR - cpi_race$RMSE_FA) / cpi_race$RMSE_AR * 100
+```
+
+**5.4.** Yes, the factors improve the forecast of 12-month CPI inflation. RMSE falls from `r round(cpi_race$RMSE_AR, 2)` (AR) to `r round(cpi_race$RMSE_FA, 2)` (with factors), a reduction of about **`r round(cpi_reduction, 1)`%**, and MAE falls from `r round(cpi_race$MAE_AR, 2)` to `r round(cpi_race$MAE_FA, 2)`. The DM p-value is `r format(signif(cpi_race$DM_pvalue, 2), scientific = FALSE)`, so the improvement is statistically significant even after adjusting for the autocorrelation in the overlapping 12-month errors.
+
+## Reflection
+
+Across these horse races, simple models were often hard to beat. The OLS VAR(1) beat the VAR(4), and a plain average of ARIMA and ETS didn't beat the best single model. Most of the time the problem wasn't that the simple model was "right," but that complex models have too many parameters to estimate well from limited data, so estimation error eats up any gain. The same idea showed up repeatedly: shrinkage in the BVAR, equal weights in a combination, and factors in the factor model are all ways of reducing the number of things we estimate. Shrinkage pulls many coefficients toward a prior, equal weights avoid estimating combination weights, and factors squeeze 121 series into three. In each case we accept a little bias to get a big reduction in variance, and the best forecasting models were the ones that used lots of information without estimating too many free parameters.

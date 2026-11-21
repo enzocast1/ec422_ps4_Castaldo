@@ -79,6 +79,90 @@ liquor_fit |>
   augment() |>
   features(.innov, ljung_box, lag = 24, dof = 6)
 
-There’s still some autocorrelation the ARIMA model didn’t capture.
+# 2.2b: The residuals do not look like white noise. The Ljung-Box test at lag
+# 24 (dof = 6) gives a statistic of 120 with a p-value of about 0, so we reject
+# the null that the residuals are white noise at the 5% level. There is still
+# some autocorrelation the ARIMA model didn't capture, though far less than
+# the trend model in PS3.
+
+liquor_cv <- liquor |>
+  stretch_tsibble(.init = 120, .step = 1) |>
+  filter(.id < max(.id))
+
+liquor_cv_fit <- liquor_cv |>
+  model(snaive = SNAIVE(sales),
+        ets    = ETS(log(sales)),
+        arima  = ARIMA(log(sales)))
+
+saveRDS(liquor_cv_fit, "results/liquor_cv_fit.rds")
+
+
+
+#2.3a: 216 forecast origins. The sample has 336 months (Jan 1992 - Dec 2019).
+# The first training window is 120 months, so the first origin is December
+# 2001,
+
+
+liquor_cv_fc <- liquor_cv_fit |>
+  forecast(h = 1)
+
+liquor_cv_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE))
+
+
+# 2.3b: The first forecast is for January 2002 (from the training sample
+# ending in December 2001) and the last is for December 2019 (from the
+# training sample ending in November 2019). The Arima model forecasts the most accurately and both metrics agree. ARIMA forecasts most accurately, with the lowest RMSE (81.4) and MAE (65.7)
+
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(as_tibble(liquor) |> select(Month, actual = sales),
+            by = "Month") |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e)
+
+forecast::dm.test(liquor_errs$arima, liquor_errs$ets, h = 1, power = 2)
+
+forecast::dm.test(liquor_errs$arima, liquor_errs$snaive, h = 1, power = 2)
+
+
+# 2.4: ARIMA vs. ETS: DM = -2.906, p-value = 0.004. ARIMA vs. SNAIVE:
+# DM = -10.755, p-value < 2.2e-16 (essentially 0). Both DM statistics are
+# negative, meaning ARIMA had smaller squared forecast errors, and both
+# p-values are well below 0.05, so we reject the null of equal forecast
+# accuracy in each case: ARIMA is significantly more accurate than both ETS
+# and the seasonal random walk benchmark. If I were the liquor store chain,
+# I would use the ARIMA model to forecast next month's sales.
+
+
+
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE))
+
+# 3a: The equal-weight combination of ARIMA and ETS has an RMSE of 85.2 and
+# an MAE of 66.8. It is more accurate than ETS (94.4 / 72.3) but slightly less
+# accurate than ARIMA (81.4 / 65.7), and much better than the seasonal random
+# walk (161 / 137). The combo lands between its two components but much closer
+# to ARIMA, especially on MAE (66.8 vs. 65.7), so averaging in the weaker ETS
+# forecast cost only a little accuracy.
+
+cor(liquor_errs$arima, liquor_errs$ets)
+# 3b: The correlation between the ARIMA and ETS forecast errors is 0.88,
+# which is very high: the two models tend to make similar mistakes, so when
+# ARIMA misses high, ETS usually misses high too. Because their errors move
+# together, averaging the two forecasts cancels out very little error.
+
+
+
+
+
+
+
+
 
 
